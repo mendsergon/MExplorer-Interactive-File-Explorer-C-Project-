@@ -34,6 +34,11 @@ typedef struct {
     explorer_flags_t flags;  // Current settings
 } interactive_state_t;
 
+// Thread-local buffers for formatting to avoid repeated stack allocations
+static __thread char human_buf[32];
+static __thread char mode_buf[16];
+static __thread char time_buf[32];
+
 // Helper function declarations - these are "private" to this file
 static void list_init(entry_list_t *l);
 static void list_free(entry_list_t *l);
@@ -45,9 +50,10 @@ static int include_entry(const file_entry_t *e, const explorer_flags_t *f);
 static void read_dir(const char *dirpath, entry_list_t *out, const explorer_flags_t *flags);
 static void print_entry(const file_entry_t *e, const explorer_flags_t *flags, int is_cursor);
 static int get_terminal_height(void);
+static int get_terminal_height_cached(void);  // Fixed: removed unused parameter
 static void clear_screen(void);
 static void setup_terminal(int enable_raw);
-static char read_single_char(void);
+static char read_single_char_optimized(void);  // Only keep the optimized version
 
 // Compare functions for sorting - used by qsort()
 static int cmp_name(const void *a, const void *b) {
@@ -85,8 +91,9 @@ static void list_init(entry_list_t *l) {
 // Free all memory - important to avoid leaks!
 static void list_free(entry_list_t *l) {
     for (size_t i = 0; i < l->used; i++) {
-        free(l->arr[i].name);   // Free the filename string
-        free(l->arr[i].path);   // Free the full path string
+        // Free the combined path+name allocation
+        free(l->arr[i].path);
+        // Don't free name separately since it points into path
     }
     free(l->arr);  // Free the array itself
     l->arr = NULL;
@@ -96,9 +103,20 @@ static void list_free(entry_list_t *l) {
 
 // Add item to list, making it bigger if needed (like C++ vector.push_back())
 static void list_push(entry_list_t *l, file_entry_t *e) {
-    // Out of space? Double the capacity (or start with 64)
+    // Out of space? Use power-of-two growth for better performance
     if (l->used == l->cap) {
         size_t newcap = l->cap ? l->cap * 2 : 64;
+        // Round up to next power of two for some allocators
+        if (newcap > 64) {
+            newcap--;
+            newcap |= newcap >> 1;
+            newcap |= newcap >> 2;
+            newcap |= newcap >> 4;
+            newcap |= newcap >> 8;
+            newcap |= newcap >> 16;
+            newcap++;
+        }
+        
         file_entry_t *tmp = realloc(l->arr, newcap * sizeof(file_entry_t));
         if (!tmp) {
             perror("realloc");
@@ -180,6 +198,20 @@ static int get_terminal_height(void) {
     return 24; // Safe default if we can't detect
 }
 
+// Cached version to reduce frequent ioctl calls - FIXED: removed unused parameter
+static int get_terminal_height_cached(void) {
+    static int cached_height = 0;
+    static time_t last_check = 0;
+    time_t now = time(NULL);
+    
+    // Only check every 500ms to reduce system calls
+    if (cached_height == 0 || now - last_check > 0.5) {
+        cached_height = get_terminal_height();
+        last_check = now;
+    }
+    return cached_height;
+}
+
 // Clear screen using ANSI escape codes (works on most terminals)
 static void clear_screen(void) {
     printf("\033[2J\033[H");  // \033[2J = clear, \033[H = move to top-left
@@ -201,11 +233,24 @@ static void setup_terminal(int enable_raw) {
     }
 }
 
-// Read exactly one character (no waiting for Enter key)
-static char read_single_char(void) {
-    char c;
-    read(STDIN_FILENO, &c, 1);
-    return c;
+// Read exactly one character (no waiting for Enter key) - optimized version
+static char read_single_char_optimized(void) {
+    char buf[8];
+    ssize_t bytes_read = read(STDIN_FILENO, buf, sizeof(buf));
+    
+    if (bytes_read <= 0) return 0;
+    
+    // Handle escape sequences in one read
+    if (buf[0] == '\033' && bytes_read >= 3 && buf[1] == '[') {
+        switch(buf[2]) {
+            case 'A': return 'k';  // Up arrow
+            case 'B': return 'j';  // Down arrow
+            case 'C': return 'l';  // Right arrow  
+            case 'D': return 'h';  // Left arrow
+        }
+    }
+    
+    return buf[0];  // Return first character
 }
 
 // Print one file entry, with optional highlighting for selected item
@@ -219,9 +264,9 @@ static void print_entry(const file_entry_t *e, const explorer_flags_t *flags, in
     if (!e->st_valid) {
         printf("??????????\t? ? ? ?????????? ?????????????????? %s", e->name);
     } else {
-        char mode[16], sizeb[32], timeb[32];
-        print_mode(e->st.st_mode, mode, sizeof(mode));
-        format_mtime(e->st.st_mtime, timeb, sizeof(timeb));
+        // Use thread-local buffers to avoid repeated stack allocations
+        print_mode(e->st.st_mode, mode_buf, sizeof(mode_buf));
+        format_mtime(e->st.st_mtime, time_buf, sizeof(time_buf));
 
         // Convert user/group IDs to names
         struct passwd *pw = getpwuid(e->st.st_uid);
@@ -229,28 +274,33 @@ static void print_entry(const file_entry_t *e, const explorer_flags_t *flags, in
         
         // Format file size (pretty or raw bytes)
         if (flags->human_readable) {
-            human_size(e->st.st_size, sizeb, sizeof(sizeb));
+            human_size(e->st.st_size, human_buf, sizeof(human_buf));
+            printf("%s %2ju %-8s %-8s %8s %s %s",
+                   mode_buf,                       // File type and permissions
+                   (uintmax_t)e->st.st_nlink,      // Number of hard links
+                   pw ? pw->pw_name : "-",         // Owner name
+                   gr ? gr->gr_name : "-",         // Group name  
+                   human_buf,                      // File size
+                   time_buf,                       // Modification time
+                   e->name);                       // Filename
         } else {
-            snprintf(sizeb, sizeof(sizeb), "%" PRIdMAX, (intmax_t)e->st.st_size);
+            printf("%s %2ju %-8s %-8s %8" PRIdMAX " %s %s",
+                   mode_buf,                       // File type and permissions
+                   (uintmax_t)e->st.st_nlink,      // Number of hard links
+                   pw ? pw->pw_name : "-",         // Owner name
+                   gr ? gr->gr_name : "-",         // Group name  
+                   (intmax_t)e->st.st_size,        // File size in bytes
+                   time_buf,                       // Modification time
+                   e->name);                       // Filename
         }
-        
-        // Print the main file info line (like ls -l)
-        printf("%s %2ju %-8s %-8s %8s %s %s",
-               mode,                       // File type and permissions
-               (uintmax_t)e->st.st_nlink,  // Number of hard links
-               pw ? pw->pw_name : "-",     // Owner name
-               gr ? gr->gr_name : "-",     // Group name  
-               sizeb,                      // File size
-               timeb,                      // Modification time
-               e->name);                   // Filename
                
         // If it's a symlink, show where it points
         if (S_ISLNK(e->st.st_mode)) {
-            char buf[PATH_MAX];
-            ssize_t r = readlink(e->path, buf, sizeof(buf) - 1);
+            char link_buf[PATH_MAX];
+            ssize_t r = readlink(e->path, link_buf, sizeof(link_buf) - 1);
             if (r > 0) {
-                buf[r] = '\0';
-                printf(" -> %s", buf);
+                link_buf[r] = '\0';
+                printf(" -> %s", link_buf);
             }
         }
     }
@@ -262,7 +312,7 @@ static void print_entry(const file_entry_t *e, const explorer_flags_t *flags, in
     printf("\n");
 }
 
-// Read all files in a directory into our list
+// Read all files in a directory into our list - optimized version
 static void read_dir(const char *path, entry_list_t *out, const explorer_flags_t *f) {
     DIR *d = opendir(path);
     if (!d) {
@@ -271,6 +321,8 @@ static void read_dir(const char *path, entry_list_t *out, const explorer_flags_t
     }
 
     struct dirent *ent;
+    size_t path_len = strlen(path);
+    
     // Read each directory entry one by one
     while ((ent = readdir(d))) {
         // Skip the special . and .. entries
@@ -278,27 +330,31 @@ static void read_dir(const char *path, entry_list_t *out, const explorer_flags_t
             continue;
         }
 
-        // Build full path by combining directory + filename
-        size_t plen = strlen(path), nlen = strlen(ent->d_name);
-        char *full = malloc(plen + nlen + 2);  // +2 for '/' and null terminator
-        if (!full) {
+        // Calculate required sizes once
+        size_t name_len = strlen(ent->d_name);
+        size_t total_len = path_len + name_len + 2;  // +2 for '/' and null terminator
+        
+        // Single allocation for combined path + name
+        char *full_path = malloc(total_len);
+        if (!full_path) {
             perror("malloc");
             continue;
         }
-        sprintf(full, "%s/%s", path, ent->d_name);
+        
+        // Build path efficiently in one operation
+        snprintf(full_path, total_len, "%s/%s", path, ent->d_name);
 
         file_entry_t fe = {0};
-        fe.name = strdup(ent->d_name);
-        fe.path = full;
-        fe.st_valid = (lstat(full, &fe.st) == 0);  // lstat works with symlinks
+        fe.path = full_path;
+        fe.name = full_path + path_len + 1;  // Name points into the path string
+        fe.st_valid = (lstat(full_path, &fe.st) == 0);  // lstat works with symlinks
 
         // Only add to list if it passes our filters
         if (include_entry(&fe, f)) {
             list_push(out, &fe);
         } else {
-            // Free memory if filtered out
-            free(fe.name);
-            free(fe.path);
+            // Free the single allocation if filtered out
+            free(full_path);
         }
     }
     closedir(d);
@@ -339,8 +395,8 @@ static void display_interface(interactive_state_t *state) {
            state->flags.dirs_only ? "Dirs" : 
            state->flags.files_only ? "Files" : "All");
     
-    // Calculate how many files we can show based on terminal size
-    int term_height = get_terminal_height();
+    // Calculate how many files we can show based on terminal size (cached)
+    int term_height = get_terminal_height_cached();  // FIXED: removed parameter
     int available_lines = term_height - 6;  // Reserve space for header/footer
     
     // Figure out which slice of files to display (for scrolling)
@@ -397,7 +453,7 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
         display_interface(&state);
         
         // Wait for and process user input
-        char key = read_single_char();
+        char key = read_single_char_optimized();
         
         switch (key) {
             case 'q':  // Quit
@@ -407,7 +463,8 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
             case 'j':  // Move down
             case '\033':  // Arrow keys start with escape sequence
                 if (key == '\033') {
-                    // Arrow keys send 3 bytes: ESC [ A/B/C/D
+                    // Arrow keys are now handled in read_single_char_optimized
+                    // This case is kept for compatibility
                     char seq[2];
                     if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
                         if (seq[0] == '[') {
@@ -432,7 +489,7 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 
             case '\n':  // Enter key - open file or directory
                 if (state.entries.used > 0) {
-                    file_entry_t *entry = &state.entries.arr[state.cursor_pos];  // FIXED: state. instead of state->
+                    file_entry_t *entry = &state.entries.arr[state.cursor_pos];
                     if (entry->st_valid && S_ISDIR(entry->st.st_mode)) {
                         // Navigate into directory
                         free(state.current_path);
@@ -441,7 +498,7 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                     } else {
                         // For files, just show a message (could be extended to open files)
                         printf("\nFile: %s (press any key to continue)", entry->name);
-                        read_single_char();
+                        read_single_char_optimized();
                     }
                 }
                 break;
@@ -515,12 +572,12 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 printf("  q - Quit the explorer\n");
                 printf("  ? - Show this help screen\n\n");
                 printf("Press any key to continue...");
-                read_single_char();
+                read_single_char_optimized();
                 break;
         }
         
         // Auto-scroll to keep cursor in view
-        int term_height = get_terminal_height();
+        int term_height = get_terminal_height_cached();  // FIXED: removed parameter
         int available_lines = term_height - 6;
         
         if (state.cursor_pos < state.scroll_offset) {
