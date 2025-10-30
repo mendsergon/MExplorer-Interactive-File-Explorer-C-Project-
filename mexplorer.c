@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <signal.h>
 
 // A dynamic array that grows as needed - like ArrayList in Java
 typedef struct {
@@ -24,13 +25,22 @@ typedef struct {
     size_t cap;         // How many items we can hold
 } entry_list_t;
 
+// History stack for back navigation
+typedef struct {
+    char **paths;       // Array of path strings
+    size_t size;        // Current number of paths in history
+    size_t capacity;    // Maximum capacity of history
+} history_stack_t;
+
 // All the state for the interactive UI
 typedef struct {
     char *current_path;      // Where we are now (like /home/user)
     entry_list_t entries;    // Files in current folder
+    history_stack_t history; // Navigation history for back button
     int cursor_pos;          // Which file is highlighted
     int scroll_offset;       // For scrolling in large folders
     int needs_refresh;       // Redraw the screen?
+    int terminal_resized;    // Terminal size changed?
     explorer_flags_t flags;  // Current settings
 } interactive_state_t;
 
@@ -39,10 +49,18 @@ static __thread char human_buf[32];
 static __thread char mode_buf[16];
 static __thread char time_buf[32];
 
+// Global state for signal handling
+static interactive_state_t *global_state = NULL;
+
 // Helper function declarations - these are "private" to this file
 static void list_init(entry_list_t *l);
 static void list_free(entry_list_t *l);
 static void list_push(entry_list_t *l, file_entry_t *e);
+static void history_init(history_stack_t *h);
+static void history_free(history_stack_t *h);
+static void history_push(history_stack_t *h, const char *path);
+static char *history_pop(history_stack_t *h);
+static int history_is_empty(const history_stack_t *h);
 static void human_size(off_t size, char *buf, size_t bufsz);
 static void print_mode(mode_t mode, char *buf, size_t bufsz);
 static void format_mtime(time_t epoch, char *buf, size_t bufsz);
@@ -50,10 +68,13 @@ static int include_entry(const file_entry_t *e, const explorer_flags_t *f);
 static void read_dir(const char *dirpath, entry_list_t *out, const explorer_flags_t *flags);
 static void print_entry(const file_entry_t *e, const explorer_flags_t *flags, int is_cursor);
 static int get_terminal_height(void);
-static int get_terminal_height_cached(void);  // Fixed: removed unused parameter
+static int get_terminal_width(void);
+static int get_terminal_height_cached(void);
 static void clear_screen(void);
 static void setup_terminal(int enable_raw);
-static char read_single_char_optimized(void);  // Only keep the optimized version
+static char read_single_char_optimized(void);
+static void restore_terminal_and_exit(interactive_state_t *state);
+static void handle_terminal_resize(int sig);
 
 // Compare functions for sorting - used by qsort()
 static int cmp_name(const void *a, const void *b) {
@@ -128,6 +149,59 @@ static void list_push(entry_list_t *l, file_entry_t *e) {
     l->arr[l->used++] = *e;  // Copy the entry and move to next slot
 }
 
+// Initialize history stack
+static void history_init(history_stack_t *h) {
+    h->paths = NULL;
+    h->size = 0;
+    h->capacity = 0;
+}
+
+// Free history stack memory
+static void history_free(history_stack_t *h) {
+    for (size_t i = 0; i < h->size; i++) {
+        free(h->paths[i]);
+    }
+    free(h->paths);
+    h->paths = NULL;
+    h->size = 0;
+    h->capacity = 0;
+}
+
+// Push a path to history
+static void history_push(history_stack_t *h, const char *path) {
+    // Resize if needed
+    if (h->size == h->capacity) {
+        size_t new_cap = h->capacity ? h->capacity * 2 : 16;
+        char **tmp = realloc(h->paths, new_cap * sizeof(char*));
+        if (!tmp) {
+            perror("realloc");
+            return;
+        }
+        h->paths = tmp;
+        h->capacity = new_cap;
+    }
+    
+    // Don't push if it's the same as the current top (to avoid duplicates)
+    if (h->size > 0 && strcmp(h->paths[h->size - 1], path) == 0) {
+        return;
+    }
+    
+    h->paths[h->size++] = strdup(path);
+}
+
+// Pop a path from history
+static char *history_pop(history_stack_t *h) {
+    if (h->size == 0) {
+        return NULL;
+    }
+    return h->paths[--h->size];
+}
+
+// Check if history is empty
+static int history_is_empty(const history_stack_t *h) {
+    return h->size == 0;
+}
+
 // Convert bytes to human readable like "1.5K" instead of "1536"
 static void human_size(off_t size, char *buf, size_t bufsz) {
     const char *units[] = {"B", "K", "M", "G", "T"};  // Bytes, Kilobytes, etc.
@@ -198,7 +272,16 @@ static int get_terminal_height(void) {
     return 24; // Safe default if we can't detect
 }
 
-// Cached version to reduce frequent ioctl calls - FIXED: removed unused parameter
+// Get terminal width
+static int get_terminal_width(void) {
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
+        return w.ws_col;
+    }
+    return 80; // Safe default
+}
+
+// Cached version to reduce frequent ioctl calls
 static int get_terminal_height_cached(void) {
     static int cached_height = 0;
     static time_t last_check = 0;
@@ -215,11 +298,13 @@ static int get_terminal_height_cached(void) {
 // Clear screen using ANSI escape codes (works on most terminals)
 static void clear_screen(void) {
     printf("\033[2J\033[H");  // \033[2J = clear, \033[H = move to top-left
+    fflush(stdout);
 }
 
 // Put terminal in "raw mode" so we can read single keypresses
 static void setup_terminal(int enable_raw) {
     static struct termios old_term, new_term;
+    static int terminal_setup = 0;
     
     if (enable_raw) {
         tcgetattr(STDIN_FILENO, &old_term);  // Save current settings
@@ -227,9 +312,20 @@ static void setup_terminal(int enable_raw) {
         // Turn off line buffering and character echo
         new_term.c_lflag &= ~(ICANON | ECHO);
         tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
-    } else {
-        // Restore original terminal settings
+        terminal_setup = 1;
+    } else if (terminal_setup) {
+        // Restore original terminal settings only if we set them up
         tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+        terminal_setup = 0;
+    }
+}
+
+// Signal handler for terminal resize
+static void handle_terminal_resize(int sig) {
+    (void)sig;  // Mark parameter as unused to avoid warning
+    if (global_state) {
+        global_state->terminal_resized = 1;
+        global_state->needs_refresh = 1;
     }
 }
 
@@ -384,8 +480,22 @@ static void load_directory(interactive_state_t *state) {
 static void display_interface(interactive_state_t *state) {
     clear_screen();
     
+    // Get terminal dimensions
+    int term_height = get_terminal_height_cached();
+    int term_width = get_terminal_width();
+    
     // Header with current location and settings
-    printf("=== MEXPLORER: %s ===\n", state->current_path);
+    printf("\033[1;36m=== MEXPLORER: %s ===\033[0m\n", state->current_path);
+    
+    // Truncate path if too long for terminal
+    char path_display[term_width];
+    snprintf(path_display, sizeof(path_display), "%s", state->current_path);
+    size_t path_len = strlen(path_display);
+    if (path_len > (size_t)(term_width - 20)) {
+        path_display[term_width - 23] = '\0';
+        strcat(path_display, "...");
+    }
+    
     printf("Settings: [Sort:%s] [Hidden:%s] [Format:%s] [Human:%s] [Filter:%s]\n\n",
            state->flags.sort_mode == SORT_NAME ? "Name" : 
            state->flags.sort_mode == SORT_SIZE ? "Size" : "Time",
@@ -395,9 +505,19 @@ static void display_interface(interactive_state_t *state) {
            state->flags.dirs_only ? "Dirs" : 
            state->flags.files_only ? "Files" : "All");
     
-    // Calculate how many files we can show based on terminal size (cached)
-    int term_height = get_terminal_height_cached();  // FIXED: removed parameter
+    // Calculate how many files we can show based on terminal size
     int available_lines = term_height - 6;  // Reserve space for header/footer
+    
+    if (available_lines < 1) {
+        available_lines = 1;  // Minimum display area
+    }
+    
+    // Adjust scroll position to keep cursor in view
+    if (state->cursor_pos < state->scroll_offset) {
+        state->scroll_offset = state->cursor_pos;
+    } else if (state->cursor_pos >= state->scroll_offset + available_lines) {
+        state->scroll_offset = state->cursor_pos - available_lines + 1;
+    }
     
     // Figure out which slice of files to display (for scrolling)
     size_t start = state->scroll_offset;
@@ -414,18 +534,80 @@ static void display_interface(interactive_state_t *state) {
         } else {
             // Simple view - just filenames with highlighting
             if (is_cursor) {
-                printf("\033[7m%-40s\033[0m\n", state->entries.arr[i].name);
+                printf("\033[7m%s\033[0m\n", state->entries.arr[i].name);
             } else {
-                printf("%-40s\n", state->entries.arr[i].name);
+                printf("%s\n", state->entries.arr[i].name);
             }
         }
     }
     
+    // Fill remaining space if we have fewer files than available lines
+    int lines_used = end - start;
+    for (int i = lines_used; i < available_lines; i++) {
+        printf("~\n");
+    }
+    
     // Footer with quick help
-    printf("\nControls: j/k=Navigate, Enter=Open, b=Back, a=Hidden, l=Long, s=Sort, ?=Help, q=Quit\n");
+    printf("\n\033[1;33mControls:\033[0m j/k=Navigate, Enter=Open, b=Back, a=Hidden, l=Long, s=Sort, H=Human, d=Dirs, f=Files, r=Refresh, ?=Help, q=Quit\n");
+    
+    fflush(stdout);
 }
 
-// The main interactive UI loop - this is where the magic happens!
+// Non-interactive directory traversal
+void traverse_directory(const char *path, const explorer_flags_t *flags) {
+    entry_list_t entries;
+    list_init(&entries);
+    read_dir(path, &entries, flags);
+    
+    // Sort entries
+    if (flags->sort_mode == SORT_NAME) {
+        qsort(entries.arr, entries.used, sizeof(file_entry_t), cmp_name);
+    } else if (flags->sort_mode == SORT_SIZE) {
+        qsort(entries.arr, entries.used, sizeof(file_entry_t), cmp_size);
+    } else if (flags->sort_mode == SORT_TIME) {
+        qsort(entries.arr, entries.used, sizeof(file_entry_t), cmp_time);
+    }
+    
+    // Print all entries
+    for (size_t i = 0; i < entries.used; i++) {
+        if (flags->long_format) {
+            print_entry(&entries.arr[i], flags, 0);
+        } else {
+            printf("%s\n", entries.arr[i].name);
+        }
+    }
+    
+    list_free(&entries);
+}
+
+// Proper cleanup function
+static void restore_terminal_and_exit(interactive_state_t *state) {
+    // Switch back to main screen buffer
+    printf("\033[?1049l");  // Switch back to main screen
+    
+    // Remove signal handlers
+    signal(SIGWINCH, SIG_DFL);
+    
+    setup_terminal(0);  // Restore normal terminal mode
+    clear_screen();     // Clear the screen
+    
+    // Reset all terminal attributes
+    printf("\033[0m");  // Reset colors and attributes
+    fflush(stdout);
+    
+    list_free(&state->entries);
+    history_free(&state->history);
+    free(state->current_path);
+    
+    // Clear the global state pointer
+    global_state = NULL;
+    
+    // Show thank you message
+    printf("Thank you for using MExplorer!\n");
+    printf("File explorer session ended.\n\n");
+}
+
+// The main interactive UI loop
 void interactive_explorer(const char *start_path, const explorer_flags_t *flags) {
     interactive_state_t state = {0};
     // Get absolute path (resolves symlinks, removes .., etc.)
@@ -436,13 +618,37 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
     }
     state.flags = *flags;  // Copy initial settings
     state.needs_refresh = 1;
+    state.terminal_resized = 0;
+    
+    // Set global state for signal handling
+    global_state = &state;
     
     list_init(&state.entries);
+    history_init(&state.history);
+    
+    // Setup signal handler for terminal resize
+    signal(SIGWINCH, handle_terminal_resize);
+    
     setup_terminal(1);  // Enable raw mode for single-key input
+    
+    // Switch to alternate screen buffer (like btop, vim, htop)
+    printf("\033[?1049h");  // Switch to alternate screen
+    fflush(stdout);
+    
+    // Load initial directory immediately
+    load_directory(&state);
     
     // Main event loop - runs until user quits
     int running = 1;
     while (running) {
+        // Handle terminal resize
+        if (state.terminal_resized) {
+            state.terminal_resized = 0;
+            state.needs_refresh = 1;
+            // Force refresh of terminal size cache
+            get_terminal_height_cached();
+        }
+        
         // Reload directory if needed (after navigation or setting changes)
         if (state.needs_refresh) {
             load_directory(&state);
@@ -491,20 +697,44 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 if (state.entries.used > 0) {
                     file_entry_t *entry = &state.entries.arr[state.cursor_pos];
                     if (entry->st_valid && S_ISDIR(entry->st.st_mode)) {
+                        // Save current directory to history before navigating
+                        history_push(&state.history, state.current_path);
+                        
                         // Navigate into directory
                         free(state.current_path);
                         state.current_path = strdup(entry->path);
                         state.needs_refresh = 1;
                     } else {
                         // For files, just show a message (could be extended to open files)
-                        printf("\nFile: %s (press any key to continue)", entry->name);
+                        clear_screen();
+                        printf("File: %s\n", entry->name);
+                        printf("Path: %s\n", entry->path);
+                        if (entry->st_valid) {
+                            printf("Size: %ld bytes\n", (long)entry->st.st_size);
+                            format_mtime(entry->st.st_mtime, time_buf, sizeof(time_buf));
+                            printf("Modified: %s\n", time_buf);
+                            print_mode(entry->st.st_mode, mode_buf, sizeof(mode_buf));
+                            printf("Permissions: %s\n", mode_buf);
+                        }
+                        printf("\nPress any key to continue...");
+                        fflush(stdout);
                         read_single_char_optimized();
+                        state.needs_refresh = 1;
                     }
                 }
                 break;
                 
-            case 'b':  // Go back to parent directory
-                {
+            case 'b':  // Go back to previous directory using history
+                if (!history_is_empty(&state.history)) {
+                    char *prev_path = history_pop(&state.history);
+                    if (prev_path && strcmp(prev_path, state.current_path) != 0) {
+                        free(state.current_path);
+                        state.current_path = strdup(prev_path);
+                        state.needs_refresh = 1;
+                    }
+                    free(prev_path);  // Free the popped path
+                } else {
+                    // If no history, try to go to parent directory as fallback
                     char *parent = realpath("..", NULL);
                     if (parent && strcmp(parent, state.current_path) != 0) {
                         free(state.current_path);
@@ -516,7 +746,7 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 }
                 break;
                 
-            // REAL-TIME FLAG TOGGLES - These are the important new features!
+            // REAL-TIME FLAG TOGGLES - These are the important features!
             case 'a':  // Toggle hidden files
                 state.flags.show_all = !state.flags.show_all;
                 state.needs_refresh = 1;
@@ -553,13 +783,12 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 
             case '?':  // Show help
                 clear_screen();
-                printf("\n=== MEXPLORER INTERACTIVE CONTROLS ===\n\n");
-                printf("NAVIGATION:\n");
+                printf("\033[1;35mMEXPLORER - INTERACTIVE FILE EXPLORER\033[0m\n\n");
+                printf("\033[1;33mNAVIGATION:\033[0m\n");
                 printf("  j / k or ↓ / ↑  - Move cursor up/down\n");
                 printf("  ENTER           - Open directory or file\n");
-                printf("  b               - Go back to parent directory\n\n");
-                
-                printf("VIEW SETTINGS (toggle on/off):\n");
+                printf("  b               - Go back to previous directory\n\n");
+                printf("\033[1;33mVIEW SETTINGS (toggle on/off):\033[0m\n");
                 printf("  a - Toggle hidden files (show/hide dotfiles)\n");
                 printf("  l - Toggle long format (detailed/simple view)\n");
                 printf("  H - Toggle human-readable file sizes\n");
@@ -567,66 +796,21 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 printf("  d - Toggle directories only filter\n");
                 printf("  f - Toggle files only filter\n");
                 printf("  r - Refresh current directory view\n\n");
-                
-                printf("OTHER:\n");
+                printf("\033[1;33mOTHER:\033[0m\n");
                 printf("  q - Quit the explorer\n");
                 printf("  ? - Show this help screen\n\n");
                 printf("Press any key to continue...");
+                fflush(stdout);
                 read_single_char_optimized();
+                state.needs_refresh = 1;
                 break;
-        }
-        
-        // Auto-scroll to keep cursor in view
-        int term_height = get_terminal_height_cached();  // FIXED: removed parameter
-        int available_lines = term_height - 6;
-        
-        if (state.cursor_pos < state.scroll_offset) {
-            state.scroll_offset = state.cursor_pos;  // Scroll up if cursor above view
-        } else if (state.cursor_pos >= state.scroll_offset + available_lines) {
-            state.scroll_offset = state.cursor_pos - available_lines + 1;  // Scroll down
+                
+            default:
+                // Ignore unknown keys
+                break;
         }
     }
     
-    // Cleanup before exit
-    setup_terminal(0);  // Restore normal terminal behavior
-    list_free(&state.entries);
-    free(state.current_path);
-    printf("\nThanks for using MEXPLORER!\n");
-}
-
-// Non-interactive mode: just list files and exit (like ls command)
-void traverse_directory(const char *path, const explorer_flags_t *flags) {
-    entry_list_t list;
-    list_init(&list);
-    read_dir(path, &list, flags);
-
-    // Sort the files
-    if (flags->sort_mode == SORT_NAME) {
-        qsort(list.arr, list.used, sizeof(file_entry_t), cmp_name);
-    } else if (flags->sort_mode == SORT_SIZE) {
-        qsort(list.arr, list.used, sizeof(file_entry_t), cmp_size);
-    } else if (flags->sort_mode == SORT_TIME) {
-        qsort(list.arr, list.used, sizeof(file_entry_t), cmp_time);
-    }
-
-    // Print directory header and contents
-    printf("%s:\n", path);
-    for (size_t i = 0; i < list.used; i++) {
-        print_entry(&list.arr[i], flags, 0);
-    }
-    printf("\n");
-
-    // If recursive mode, go into subdirectories
-    if (flags->recursive) {
-        for (size_t i = 0; i < list.used; i++) {
-            if (list.arr[i].st_valid && S_ISDIR(list.arr[i].st.st_mode)) {
-                // Skip . and .. to avoid infinite loops
-                if (strcmp(list.arr[i].name, ".") != 0 && 
-                    strcmp(list.arr[i].name, "..") != 0) {
-                    traverse_directory(list.arr[i].path, flags);
-                }
-            }
-        }
-    }
-    list_free(&list);
+    // PROPER CLEANUP
+    restore_terminal_and_exit(&state);
 }
