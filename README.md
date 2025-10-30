@@ -4,20 +4,22 @@
 
 **MExplorer** is a **terminal-based file explorer** written in C that provides both interactive and non-interactive modes for navigating the filesystem. It allows users to browse directories, view file details, and filter or sort files in real-time, mimicking features from common Unix utilities like `ls` and `mc` (Midnight Commander). The program leverages **POSIX APIs**, dynamic memory management, and terminal control to create a responsive and user-friendly console interface.
 
-**Version:** 1.0.1  
-**Latest Updates:** Performance optimizations for memory and system call efficiency
+**Version:** 1.0.2  
+**Latest Updates:** Navigation history, alternate screen buffer, immediate startup
 
 ---
 
 ### Core Features
 
 * **Interactive File Navigation** – Move through directories using keyboard keys (`j/k` or arrow keys) and open files or subdirectories.
+* **Navigation History** – Proper back navigation through visited directories using stack-based history.
+* **Alternate Screen Buffer** – Uses terminal alternate screen to prevent scrollback artifacts.
 * **Real-Time UI Controls** – Toggle hidden files, switch between short/long view, human-readable sizes, and sort order without restarting the program.
 * **Sorting & Filtering** – Sort files by name, size, or modification time; filter to show only directories or files.
 * **Recursive Directory Traversal** – Non-interactive mode supports recursive listing of files.
 * **Detailed File Metadata** – View permissions, ownership, size, and modification time (similar to `ls -l`).
 * **Symlink Resolution** – Displays symlink targets when present.
-* **Terminal-Aware Display** – Adjusts the UI based on terminal height, supports scrolling in large directories.
+* **Terminal-Aware Display** – Adjusts the UI based on terminal height, supports scrolling in large directories, handles terminal resizes.
 * **Batch Mode** – Simple, script-friendly listing of directory contents without interactive UI.
 
 ---
@@ -25,7 +27,10 @@
 ### Key Methods and Algorithms
 
 * **Dynamic Array Management:**
-  Implements a resizable array (`entry_list_t`) to store file entries, similar to `std::vector` in C++, with power-of-two growth strategy for optimal performance.
+  Implements a resizable array (`entry_list_t`) to store file entries with power-of-two growth strategy for optimal performance.
+
+* **Navigation History Stack:**
+  Implements stack-based history (`history_stack_t`) for proper back navigation through visited directories.
 
 * **File Metadata Handling:**
   Uses `lstat()` to gather file stats and stores them in `file_entry_t`, including size, permissions, and timestamps.
@@ -34,7 +39,7 @@
   Provides `qsort()` comparators (`cmp_name`, `cmp_size`, `cmp_time`) to sort file entries dynamically.
 
 * **Terminal Control:**
-  Uses ANSI escape codes for clearing the screen and highlighting selected entries; employs `termios` for raw input mode to capture single keystrokes with cached terminal size detection.
+  Uses ANSI escape codes for clearing the screen and highlighting selected entries; employs `termios` for raw input mode to capture single keystrokes with cached terminal size detection; uses alternate screen buffer to prevent scrollback artifacts.
 
 * **Human-Readable Size Conversion:**
   Converts file sizes into readable units (B, K, M, G, T) for easier interpretation using thread-local buffers.
@@ -50,13 +55,14 @@
 
 ---
 
-### Performance Optimizations (v1.0.1)
+### Performance Optimizations (v1.0.2)
 
 * **Memory Efficiency:** Combined path and name storage in single allocation per file entry
 * **System Call Reduction:** Cached terminal height detection with 500ms TTL
 * **Input Handling:** Batched escape sequence reads for arrow key detection
 * **Formatting Optimization:** Thread-local buffers for repeated string operations
 * **Compiler Optimizations:** Aggressive flags for maximum performance
+* **Terminal Optimization:** Alternate screen buffer for clean display
 
 ---
 
@@ -66,11 +72,13 @@
 * File system exploration using POSIX APIs (`opendir`, `readdir`, `lstat`)
 * Real-time interactive input handling in C
 * Dynamic memory allocation and cleanup for complex data structures
+* Stack-based navigation history implementation
 * Sorting and filtering of structured data
 * Recursive algorithm design for filesystem traversal
 * Modular program design separating UI, file handling, and utility functions
 * Command-line argument parsing with `getopt()`
 * Performance optimization and system call reduction techniques
+* Terminal signal handling (SIGWINCH) for resize events
 * Cross-platform compatible, text-based interface
 
 ---
@@ -94,13 +102,13 @@
   Uses `traverse_directory()` to list files recursively or non-recursively based on flags.
 
 * **Data Structures:**
-  `file_entry_t` holds file metadata, `entry_list_t` stores a dynamic list of entries, and `interactive_state_t` manages UI state.
+  `file_entry_t` holds file metadata, `entry_list_t` stores a dynamic list of entries, `history_stack_t` manages navigation history, and `interactive_state_t` manages UI state.
 
 * **Sorting & Filtering:**
   Sort modes: alphabetical, size, modification time; filtering by hidden, files-only, or directories-only.
 
 * **Terminal Management:**
-  `termios` for raw mode input, cached `ioctl` for terminal size, ANSI codes for screen clearing and highlighting.
+  `termios` for raw mode input, cached `ioctl` for terminal size, ANSI codes for screen clearing and highlighting, alternate screen buffer for clean display.
 
 * **Memory Management:**
   Combined allocations for path/name storage, power-of-two array growth, thread-local formatting buffers.
@@ -152,7 +160,7 @@ Once running in interactive mode:
 NAVIGATION:
   j / k or ↓ / ↑  - Move cursor up/down
   ENTER           - Open directory or file
-  b               - Go back to parent directory
+  b               - Go back to previous directory (navigation history)
 
 VIEW SETTINGS (toggle on/off):
   a - Toggle hidden files (show/hide dotfiles)
@@ -181,5 +189,6 @@ OTHER:
 
 ### Version History
 
+* **v1.0.2** - Navigation history, alternate screen buffer, immediate startup
 * **v1.0.1** - Performance optimizations: memory efficiency, system call reduction, input handling
 * **v1.0.0** - Initial release with core file explorer functionality
