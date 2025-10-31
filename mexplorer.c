@@ -496,14 +496,19 @@ static void display_interface(interactive_state_t *state) {
         strcat(path_display, "...");
     }
     
-    printf("Settings: [Sort:%s] [Hidden:%s] [Format:%s] [Human:%s] [Filter:%s]\n\n",
+    // Calculate current position (1-based) and total
+    int current_pos = state->entries.used > 0 ? state->cursor_pos + 1 : 0;
+    int total_files = state->entries.used;
+    
+    printf("Settings: [Sort:%s] [Hidden:%s] [Format:%s] [Human:%s] [Filter:%s] [Pos:%d/%d]\n\n",
            state->flags.sort_mode == SORT_NAME ? "Name" : 
            state->flags.sort_mode == SORT_SIZE ? "Size" : "Time",
            state->flags.show_all ? "ON" : "OFF",
            state->flags.long_format ? "Long" : "Short",
            state->flags.human_readable ? "ON" : "OFF",
            state->flags.dirs_only ? "Dirs" : 
-           state->flags.files_only ? "Files" : "All");
+           state->flags.files_only ? "Files" : "All",
+           current_pos, total_files);
     
     // Calculate how many files we can show based on terminal size
     int available_lines = term_height - 6;  // Reserve space for header/footer
