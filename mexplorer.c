@@ -17,8 +17,10 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
-// A dynamic array that grows as needed - like ArrayList in Java
+// A dynamic array that grows as needed 
 typedef struct {
     file_entry_t *arr;  // The actual array of files
     size_t used;        // How many items we have now
@@ -34,7 +36,7 @@ typedef struct {
 
 // All the state for the interactive UI
 typedef struct {
-    char *current_path;      // Where we are now (like /home/user)
+    char *current_path;      // Current path
     entry_list_t entries;    // Files in current folder
     history_stack_t history; // Navigation history for back button
     int cursor_pos;          // Which file is highlighted
@@ -42,6 +44,8 @@ typedef struct {
     int needs_refresh;       // Redraw the screen?
     int terminal_resized;    // Terminal size changed?
     explorer_flags_t flags;  // Current settings
+    char *clipboard_path;    // For copy/move operations
+    int clipboard_is_move;   // 1 for move, 0 for copy
 } interactive_state_t;
 
 // Thread-local buffers for formatting to avoid repeated stack allocations
@@ -75,6 +79,13 @@ static void setup_terminal(int enable_raw);
 static char read_single_char_optimized(void);
 static void restore_terminal_and_exit(interactive_state_t *state);
 static void handle_terminal_resize(int sig);
+static void create_new_file_or_dir(interactive_state_t *state);
+static void delete_selected_entry(interactive_state_t *state);
+static void copy_selected_entry(interactive_state_t *state);
+static void move_selected_entry(interactive_state_t *state);
+static void paste_from_clipboard(interactive_state_t *state);
+static int copy_file(const char *src, const char *dst);
+static int copy_directory(const char *src, const char *dst);
 
 // Compare functions for sorting - used by qsort()
 static int cmp_name(const void *a, const void *b) {
@@ -109,7 +120,7 @@ static void list_init(entry_list_t *l) {
     l->cap = 0;
 }
 
-// Free all memory - important to avoid leaks!
+// Free all memory 
 static void list_free(entry_list_t *l) {
     for (size_t i = 0; i < l->used; i++) {
         // Free the combined path+name allocation
@@ -202,7 +213,7 @@ static int history_is_empty(const history_stack_t *h) {
     return h->size == 0;
 }
 
-// Convert bytes to human readable like "1.5K" instead of "1536"
+// Convert bytes to human readable 
 static void human_size(off_t size, char *buf, size_t bufsz) {
     const char *units[] = {"B", "K", "M", "G", "T"};  // Bytes, Kilobytes, etc.
     double s = (double)size;
@@ -245,7 +256,7 @@ static void print_mode(mode_t m, char *buf, size_t n) {
 static void format_mtime(time_t t, char *b, size_t n) {
     struct tm tm;
     localtime_r(&t, &tm);  // Convert to local time (thread-safe version)
-    strftime(b, n, "%Y-%m-%d %H:%M", &tm);  // Format like "2024-01-15 14:30"
+    strftime(b, n, "%Y-%m-%d %H:%M", &tm);  // Format 
 }
 
 // Should we show this file based on current filters?
@@ -263,7 +274,7 @@ static int include_entry(const file_entry_t *e, const explorer_flags_t *f) {
     return 1;  // Passed all filters
 }
 
-// Get terminal height so we know how many lines we can display
+// Get terminal height 
 static int get_terminal_height(void) {
     struct winsize w;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
@@ -301,7 +312,7 @@ static void clear_screen(void) {
     fflush(stdout);
 }
 
-// Put terminal in "raw mode" so we can read single keypresses
+// Put terminal in "raw mode" to read single keypresses
 static void setup_terminal(int enable_raw) {
     static struct termios old_term, new_term;
     static int terminal_setup = 0;
@@ -329,7 +340,7 @@ static void handle_terminal_resize(int sig) {
     }
 }
 
-// Read exactly one character (no waiting for Enter key) - optimized version
+// Read exactly one character (no waiting for Enter key) 
 static char read_single_char_optimized(void) {
     char buf[8];
     ssize_t bytes_read = read(STDIN_FILENO, buf, sizeof(buf));
@@ -401,14 +412,14 @@ static void print_entry(const file_entry_t *e, const explorer_flags_t *flags, in
         }
     }
     
-    // Turn off highlighting if we turned it on
+    // Turn off highlighting 
     if (is_cursor) {
         printf("\033[0m");  // Reset text attributes
     }
     printf("\n");
 }
 
-// Read all files in a directory into our list - optimized version
+// Read all files in a directory into our list 
 static void read_dir(const char *path, entry_list_t *out, const explorer_flags_t *f) {
     DIR *d = opendir(path);
     if (!d) {
@@ -476,6 +487,306 @@ static void load_directory(interactive_state_t *state) {
     state->scroll_offset = 0;
 }
 
+// Create new file or directory with inline prompt
+static void create_new_file_or_dir(interactive_state_t *state) {
+    char name_buf[512] = {0};
+    int pos = 0;
+    int creating = 1;
+    
+    // Show creation prompt
+    clear_screen();
+    printf("\033[1;36m=== CREATE NEW FILE OR DIRECTORY ===\033[0m\n\n");
+    printf("Current directory: %s\n\n", state->current_path);
+    printf("Enter name (add / at end for directory, or leave empty to cancel):\n");
+    printf("> ");
+    fflush(stdout);
+    
+    // Simple line input in raw mode
+    while (creating) {
+        char c = read_single_char_optimized();
+        
+        switch (c) {
+            case '\n':  // Enter - finish input
+                creating = 0;
+                break;
+                
+            case 127:   // Backspace
+            case '\b':  // Sometimes backspace sends \b
+                if (pos > 0) {
+                    pos--;
+                    name_buf[pos] = '\0';
+                    printf("\b \b");  // Erase character from display
+                    fflush(stdout);
+                }
+                break;
+                
+            case '\033':  // Escape - cancel
+                pos = 0;
+                name_buf[0] = '\0';
+                creating = 0;
+                break;
+                
+            default:
+                // Only accept printable characters and don't overflow buffer
+                if (c >= 32 && c <= 126 && pos < (int)sizeof(name_buf) - 1) {
+                    name_buf[pos++] = c;
+                    name_buf[pos] = '\0';
+                    putchar(c);
+                    fflush(stdout);
+                }
+                break;
+        }
+    }
+    
+    // Process the created name
+    if (pos > 0) {
+        int is_directory = (name_buf[pos - 1] == '/');
+        
+        // Remove trailing slash for directory creation
+        if (is_directory && pos > 1) {
+            name_buf[pos - 1] = '\0';
+        }
+        
+        // Build full path
+        char full_path[PATH_MAX];
+        snprintf(full_path, sizeof(full_path), "%s/%s", state->current_path, name_buf);
+        
+        int result = 0;
+        
+        if (is_directory) {
+            // Create directory with standard permissions
+            result = mkdir(full_path, 0755);
+            if (result == 0) {
+                printf("\n\033[1;32m✓ Directory '%s' created successfully!\033[0m\n", name_buf);
+            } else {
+                printf("\n\033[1;31m✗ Failed to create directory: %s\033[0m\n", strerror(errno));
+            }
+        } else {
+            // Create empty file (like touch command)
+            FILE *f = fopen(full_path, "w");
+            if (f) {
+                fclose(f);
+                result = 0;
+                printf("\n\033[1;32m✓ File '%s' created successfully!\033[0m\n", name_buf);
+            } else {
+                result = -1;
+                printf("\n\033[1;31m✗ Failed to create file: %s\033[0m\n", strerror(errno));
+            }
+        }
+        
+        if (result == 0) {
+            // Refresh the directory view to show the new item
+            state->needs_refresh = 1;
+        }
+    }
+}
+
+// Delete selected file or directory with confirmation
+static void delete_selected_entry(interactive_state_t *state) {
+    if (state->entries.used == 0) return;
+    
+    file_entry_t *entry = &state->entries.arr[state->cursor_pos];
+    
+    // Show confirmation prompt
+    clear_screen();
+    printf("\033[1;31m=== DELETE CONFIRMATION ===\033[0m\n\n");
+    printf("Are you sure you want to delete:\n");
+    printf("Name: %s\n", entry->name);
+    printf("Path: %s\n", entry->path);
+    
+    if (entry->st_valid) {
+        if (S_ISDIR(entry->st.st_mode)) {
+            printf("Type: Directory\n");
+        } else {
+            printf("Type: File\n");
+            printf("Size: %ld bytes\n", (long)entry->st.st_size);
+        }
+    }
+    
+    printf("\nThis action cannot be undone!\n");
+    printf("\nPress 'y' to confirm, any other key to cancel: ");
+    fflush(stdout);
+    
+    char confirm = read_single_char_optimized();
+    if (confirm == 'y' || confirm == 'Y') {
+        int result;
+        if (entry->st_valid && S_ISDIR(entry->st.st_mode)) {
+            result = rmdir(entry->path);
+        } else {
+            result = unlink(entry->path);
+        }
+        
+        if (result == 0) {
+            printf("\n\033[1;32m✓ Deleted successfully!\033[0m\n");
+            state->needs_refresh = 1;
+        } else {
+            printf("\n\033[1;31m✗ Failed to delete: %s\033[0m\n", strerror(errno));
+        }
+    } else {
+        printf("\nDeletion cancelled.\n");
+    }
+}
+
+// Copy file implementation
+static int copy_file(const char *src, const char *dst) {
+    FILE *src_file = fopen(src, "rb");
+    if (!src_file) return -1;
+    
+    FILE *dst_file = fopen(dst, "wb");
+    if (!dst_file) {
+        fclose(src_file);
+        return -1;
+    }
+    
+    char buffer[8192];
+    size_t bytes;
+    int success = 0;
+    
+    while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
+        if (fwrite(buffer, 1, bytes, dst_file) != bytes) {
+            success = -1;
+            break;
+        }
+    }
+    
+    fclose(src_file);
+    fclose(dst_file);
+    return success;
+}
+
+// Copy directory recursively
+static int copy_directory(const char *src, const char *dst) {
+    // Create destination directory
+    if (mkdir(dst, 0755) != 0) return -1;
+    
+    DIR *dir = opendir(src);
+    if (!dir) return -1;
+    
+    struct dirent *entry;
+    int success = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        
+        char src_path[PATH_MAX];
+        char dst_path[PATH_MAX];
+        snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
+        
+        struct stat st;
+        if (lstat(src_path, &st) != 0) {
+            success = -1;
+            break;
+        }
+        
+        if (S_ISDIR(st.st_mode)) {
+            if (copy_directory(src_path, dst_path) != 0) {
+                success = -1;
+                break;
+            }
+        } else {
+            if (copy_file(src_path, dst_path) != 0) {
+                success = -1;
+                break;
+            }
+        }
+    }
+    
+    closedir(dir);
+    return success;
+}
+
+// Copy selected entry to clipboard
+static void copy_selected_entry(interactive_state_t *state) {
+    if (state->entries.used == 0) return;
+    
+    file_entry_t *entry = &state->entries.arr[state->cursor_pos];
+    
+    // Free existing clipboard
+    if (state->clipboard_path) {
+        free(state->clipboard_path);
+    }
+    
+    state->clipboard_path = strdup(entry->path);
+    state->clipboard_is_move = 0;
+    
+    printf("\n\033[1;32m✓ Copied '%s' to clipboard\033[0m\n", entry->name);
+}
+
+// Move selected entry to clipboard
+static void move_selected_entry(interactive_state_t *state) {
+    if (state->entries.used == 0) return;
+    
+    file_entry_t *entry = &state->entries.arr[state->cursor_pos];
+    
+    // Free existing clipboard
+    if (state->clipboard_path) {
+        free(state->clipboard_path);
+    }
+    
+    state->clipboard_path = strdup(entry->path);
+    state->clipboard_is_move = 1;
+    
+    printf("\n\033[1;32m✓ Cut '%s' to clipboard\033[0m\n", entry->name);
+}
+
+// Paste from clipboard
+static void paste_from_clipboard(interactive_state_t *state) {
+    if (!state->clipboard_path) {
+        printf("\n\033[1;31m✗ Clipboard is empty\033[0m\n");
+        return;
+    }
+    
+    // Get source name
+    char *src_name = strrchr(state->clipboard_path, '/');
+    if (!src_name) src_name = state->clipboard_path;
+    else src_name++;
+    
+    // Build destination path
+    char dst_path[PATH_MAX];
+    snprintf(dst_path, sizeof(dst_path), "%s/%s", state->current_path, src_name);
+    
+    int result = 0;
+    
+    if (state->clipboard_is_move) {
+        // Move operation
+        result = rename(state->clipboard_path, dst_path);
+        if (result == 0) {
+            printf("\n\033[1;32m✓ Moved '%s' successfully!\033[0m\n", src_name);
+            // Free clipboard after successful move
+            free(state->clipboard_path);
+            state->clipboard_path = NULL;
+        } else {
+            printf("\n\033[1;31m✗ Failed to move: %s\033[0m\n", strerror(errno));
+        }
+    } else {
+        // Copy operation
+        struct stat st;
+        if (lstat(state->clipboard_path, &st) != 0) {
+            printf("\n\033[1;31m✗ Failed to access source: %s\033[0m\n", strerror(errno));
+            return;
+        }
+        
+        if (S_ISDIR(st.st_mode)) {
+            result = copy_directory(state->clipboard_path, dst_path);
+        } else {
+            result = copy_file(state->clipboard_path, dst_path);
+        }
+        
+        if (result == 0) {
+            printf("\n\033[1;32m✓ Copied '%s' successfully!\033[0m\n", src_name);
+        } else {
+            printf("\n\033[1;31m✗ Failed to copy: %s\033[0m\n", strerror(errno));
+        }
+    }
+    
+    if (result == 0) {
+        state->needs_refresh = 1;
+    }
+}
+
 // Draw the entire interactive UI
 static void display_interface(interactive_state_t *state) {
     clear_screen();
@@ -486,6 +797,14 @@ static void display_interface(interactive_state_t *state) {
     
     // Header with current location and settings
     printf("\033[1;36m=== MEXPLORER: %s ===\033[0m\n", state->current_path);
+    
+    // Show clipboard status
+    if (state->clipboard_path) {
+        char *clip_name = strrchr(state->clipboard_path, '/');
+        if (!clip_name) clip_name = state->clipboard_path;
+        else clip_name++;
+        printf("Clipboard: %s '%s'\n", state->clipboard_is_move ? "MOVE" : "COPY", clip_name);
+    }
     
     // Truncate path if too long for terminal
     char path_display[term_width];
@@ -546,14 +865,14 @@ static void display_interface(interactive_state_t *state) {
         }
     }
     
-    // Fill remaining space if we have fewer files than available lines
+    // Fill remaining space if fewer files than available lines
     int lines_used = end - start;
     for (int i = lines_used; i < available_lines; i++) {
         printf("~\n");
     }
     
     // Footer with quick help
-    printf("\n\033[1;33mControls:\033[0m j/k=Navigate, Enter=Open, b=Back, a=Hidden, l=Long, s=Sort, H=Human, d=Dirs, f=Files, r=Refresh, ?=Help, q=Quit\n");
+    printf("\n\033[1;33mControls:\033[0m j/k=Navigate, Enter=Open, b=Back, a=Hidden, l=Long, s=Sort, H=Human, d=Dirs, f=Files, n=New, D=Delete, c=Copy, m=Move, p=Paste, r=Refresh, ?=Help, q=Quit\n");
     
     fflush(stdout);
 }
@@ -603,6 +922,9 @@ static void restore_terminal_and_exit(interactive_state_t *state) {
     list_free(&state->entries);
     history_free(&state->history);
     free(state->current_path);
+    if (state->clipboard_path) {
+        free(state->clipboard_path);
+    }
     
     // Clear the global state pointer
     global_state = NULL;
@@ -624,6 +946,8 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
     state.flags = *flags;  // Copy initial settings
     state.needs_refresh = 1;
     state.terminal_resized = 0;
+    state.clipboard_path = NULL;
+    state.clipboard_is_move = 0;
     
     // Set global state for signal handling
     global_state = &state;
@@ -751,7 +1075,7 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 }
                 break;
                 
-            // REAL-TIME FLAG TOGGLES - These are the important features!
+            // REAL-TIME FLAG TOGGLES 
             case 'a':  // Toggle hidden files
                 state.flags.show_all = !state.flags.show_all;
                 state.needs_refresh = 1;
@@ -782,6 +1106,26 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 state.needs_refresh = 1;
                 break;
                 
+            case 'n':  // Create new file or directory
+                create_new_file_or_dir(&state);
+                break;
+                
+            case 'D':  // Delete selected file or directory
+                delete_selected_entry(&state);
+                break;
+                
+            case 'c':  // Copy selected file/directory
+                copy_selected_entry(&state);
+                break;
+                
+            case 'm':  // Move (cut) selected file/directory
+                move_selected_entry(&state);
+                break;
+                
+            case 'p':  // Paste from clipboard
+                paste_from_clipboard(&state);
+                break;
+                
             case 'r':  // Refresh (re-read directory)
                 state.needs_refresh = 1;
                 break;
@@ -801,6 +1145,13 @@ void interactive_explorer(const char *start_path, const explorer_flags_t *flags)
                 printf("  d - Toggle directories only filter\n");
                 printf("  f - Toggle files only filter\n");
                 printf("  r - Refresh current directory view\n\n");
+                printf("\033[1;33mCREATION & DELETION:\033[0m\n");
+                printf("  n - Create new file or directory (inline prompt)\n");
+                printf("  D - Delete selected file or directory (with confirmation)\n\n");
+                printf("\033[1;33mCOPY/PASTE:\033[0m\n");
+                printf("  c - Copy selected file/directory to clipboard\n");
+                printf("  m - Move (cut) selected file/directory to clipboard\n");
+                printf("  p - Paste from clipboard to current directory\n\n");
                 printf("\033[1;33mOTHER:\033[0m\n");
                 printf("  q - Quit the explorer\n");
                 printf("  ? - Show this help screen\n\n");

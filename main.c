@@ -19,6 +19,8 @@ static void usage(const char *prog) {
             "  H          - Toggle human-readable sizes\n"
             "  d          - Show only directories\n" 
             "  f          - Show only files\n"
+            "  n          - Create new file/directory\n"
+            "  D          - Delete selected file/directory\n"
             "  r          - Refresh view\n"
             "  q          - Quit\n"
             "  ?          - Show this help\n\n"
@@ -37,7 +39,7 @@ static void usage(const char *prog) {
             prog);
 }
 
-// The program starts here - like the main() in Java or C#
+// Main function
 int main(int argc, char **argv) {
     // Start with all flags turned off (0 means false/no)
     explorer_flags_t flags = {0};
@@ -66,7 +68,7 @@ int main(int argc, char **argv) {
         }
     }
     
-    // Can't show only folders AND only files - that makes no sense!
+    // Can't show only folders AND only files 
     if (flags.dirs_only && flags.files_only) {
         fprintf(stderr, "Error: Can't use -d (dirs only) and -f (files only) together.\n");
         return EXIT_FAILURE;
